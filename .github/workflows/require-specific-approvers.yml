@@ -9,20 +9,19 @@ on:
     types: [submitted, dismissed]
 
 permissions:
-  pull-requests: read
+  pull-requests: write
+  contents: read
 
 jobs:
   check-approvals:
     name: check-approvals
     runs-on: ubuntu-latest
-    env:
-      TEAM_MEMBERS_TOKEN: ${{ secrets.TEAM_MEMBERS_TOKEN }}
     steps:
       - name: Validate approvals from required users
         uses: actions/github-script@v7
         with:
-          # Use default token for PR operations
-          github-token: ${{ github.token }}
+          # Use the PAT for all API calls
+          github-token: ${{ secrets.TEAM_MEMBERS_TOKEN }}
           script: |
             const pr = context.payload.pull_request;
             if (!pr) {
@@ -36,51 +35,52 @@ jobs:
             }
 
             const prAuthor = pr.user && pr.user.login ? pr.user.login.toLowerCase() : undefined;
+            core.info(`PR #${pr.number} by ${prAuthor}`);
 
             // Hardcoded team configuration
             const teamOrg = 'stevenson-space';
             const teamSlug = 'dedicated-contributors';
+            
+            // Fetch team members using the PAT
             let teamMembers = [];
             try {
-              const teamToken = process.env.TEAM_MEMBERS_TOKEN;
-              if (!teamToken) {
-                core.setFailed('TEAM_MEMBERS_TOKEN is not set. Add a repo secret with a PAT that has read:org.');
-                return;
-              }
               let page = 1;
               while (true) {
-                const url = `https://api.github.com/orgs/${teamOrg}/teams/${teamSlug}/members?per_page=100&page=${page}`;
-                const res = await fetch(url, {
-                  headers: {
-                    'Authorization': `Bearer ${teamToken}`,
-                    'Accept': 'application/vnd.github+json',
-                    'X-GitHub-Api-Version': '2022-11-28',
-                    'User-Agent': 'actions/github-script'
-                  }
+                const { data } = await github.rest.teams.listMembersInOrg({
+                  org: teamOrg,
+                  team_slug: teamSlug,
+                  per_page: 100,
+                  page: page
                 });
-                if (!res.ok) {
-                  const text = await res.text();
-                  core.setFailed(`Failed to list team members (${teamOrg}/${teamSlug}): HTTP ${res.status}. ${text}`);
-                  return;
-                }
-                const data = await res.json();
                 teamMembers = teamMembers.concat((data || []).map(u => (u.login || '').toLowerCase()).filter(Boolean));
-                if (!Array.isArray(data) || data.length < 100) break;
+                if (!data || data.length < 100) break;
                 page += 1;
                 if (page > 20) break; // safety cap
               }
             } catch (e) {
-              core.setFailed(`Unable to list team members for ${teamOrg}/${teamSlug}. ${e && e.message ? e.message : e}`);
+              core.setFailed(`Unable to list team members for ${teamOrg}/${teamSlug}: ${e.message}`);
               return;
             }
 
-            const eligible = [...new Set(teamMembers.filter(u => u !== prAuthor))];
+            if (teamMembers.length === 0) {
+              core.setFailed(`No members found in team ${teamOrg}/${teamSlug}`);
+              return;
+            }
+
+            core.info(`Team members found: ${teamMembers.join(', ')}`);
+
+            // Exclude the PR author from eligible approvers
+            const eligible = teamMembers.filter(u => u !== prAuthor);
+            
             if (eligible.length === 0) {
               core.setFailed('No eligible approvers in the team after excluding the PR author.');
               return;
             }
 
-            const required = eligible;
+            // Calculate half or more (50% rounded up)
+            const requiredCount = Math.ceil(eligible.length / 2);
+            core.info(`Eligible approvers (excluding PR author): ${eligible.join(', ')}`);
+            core.info(`Required approvals: ${requiredCount} out of ${eligible.length} (half or more)`);
 
             const { owner, repo } = context.repo;
             const pull_number = pr.number;
@@ -91,16 +91,26 @@ jobs:
               return;
             }
 
+            core.info(`Current head SHA: ${headSha}`);
+
             // Fetch all reviews (paginate if necessary)
             let allReviews = [];
             let page = 1;
             while (true) {
-              const { data } = await github.rest.pulls.listReviews({ owner, repo, pull_number, per_page: 100, page });
+              const { data } = await github.rest.pulls.listReviews({ 
+                owner, 
+                repo, 
+                pull_number, 
+                per_page: 100, 
+                page 
+              });
               allReviews = allReviews.concat(data || []);
               if (!data || data.length < 100) break;
               page += 1;
               if (page > 10) break; // safety cap
             }
+
+            core.info(`Total reviews found: ${allReviews.length}`);
 
             // Keep the latest review per user
             const latestByUser = new Map();
@@ -115,28 +125,37 @@ jobs:
               }
             }
 
-            // Evaluate approvals from the designated approvers on the current head SHA
+            // Count approvals from eligible team members on the current head SHA
             const approvedBy = [];
-            for (const username of required) {
+            const dismissedOrChangesBy = [];
+            
+            for (const username of eligible) {
               const review = latestByUser.get(username);
-              if (review && review.state === 'APPROVED' && review.commit_id === headSha) {
+              if (!review) {
+                continue;
+              }
+              
+              core.info(`${username}: state=${review.state}, commit=${review.commit_id}, current=${headSha}`);
+              
+              if (review.commit_id === headSha && review.state === 'APPROVED') {
                 approvedBy.push(username);
+              } else if (review.state === 'CHANGES_REQUESTED' || review.state === 'DISMISSED') {
+                dismissedOrChangesBy.push(username);
               }
             }
 
-            const requiredCount = Math.floor(required.length / 2) + 1;
-
-            core.info(`PR author: ${prAuthor || 'unknown'}`);
-            core.info(`Team scope: ${teamOrg}/${teamSlug}`);
-            core.info(`Eligible approvers (author excluded): ${required.join(', ')}`);
-            core.info(`Approved by (latest head): ${approvedBy.join(', ') || 'none'}`);
-            core.info(`Approvals required: ${requiredCount} (policy: majority)`);
+            core.info(`Approved by (on current commit): ${approvedBy.join(', ') || 'none'}`);
+            core.info(`Changes requested or dismissed: ${dismissedOrChangesBy.join(', ') || 'none'}`);
 
             if (approvedBy.length < requiredCount) {
               const remaining = requiredCount - approvedBy.length;
-              const stillEligible = required.filter(u => !approvedBy.includes(u));
-              core.setFailed(`Insufficient approvals: ${approvedBy.length}/${requiredCount}. Need ${remaining} more from: ${stillEligible.join(', ')}`);
+              const stillNeeded = eligible.filter(u => !approvedBy.includes(u));
+              core.setFailed(
+                `❌ Insufficient approvals: ${approvedBy.length}/${requiredCount}.\n` +
+                `Need ${remaining} more approval(s) from eligible reviewers.\n` +
+                `Still can approve: ${stillNeeded.join(', ')}`
+              );
               return;
             }
 
-            core.info('All required approvers have approved the latest commit.');
+            core.info(`✅ Success! ${approvedBy.length}/${requiredCount} required approvals received.`);
